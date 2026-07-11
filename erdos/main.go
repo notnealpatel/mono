@@ -1,22 +1,20 @@
-// Package main implements a thin client
-// around the teorth/erdosproblems repo
-// for metadata and fetching upstream Erdos
-// problems.
+// Package main implements a thin client for
+// Erdos problem metadata and upstream fetching.
 //
-// The LaTeX endpoint response is tokenzied
-// using golang.org/x/net/html. The problem
-// metadata is tokenized using the default
-// tokenizer in patel.codes/ranking for vector
-// search.
+// The list and search commands POST the retrieval
+// wire format ({"subcommand": ..., "query": ...})
+// to /erdos on the supermarket:9001 tailscale node
+// and write the response body to stdout.
 //
-// Similarly to patel.codes/oeis, a 'fetched'
-// tombstone prevents upstream from being hit
-// more than once per day and each problem
-// from itself being queried upstream more
-// than once per day.
+// The fetch command hits erdosproblems.com directly.
+// The LaTeX endpoint response is tokenized using
+// golang.org/x/net/html, and a 'fetched' tombstone
+// prevents each problem from being queried upstream
+// more than once per day.
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -25,15 +23,12 @@ import (
 	"net/http"
 	neturl "net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strings"
 	"time"
 
 	"golang.org/x/net/html"
-	"gopkg.in/yaml.v3"
-	"patel.codes/ranking"
 )
 
 var httpClient = &http.Client{Timeout: 30 * time.Second}
@@ -50,11 +45,6 @@ func main() {
 		erdosCacheDir = filepath.Join(base, "erdos")
 	}
 
-	if err := ensureRepo(); err != nil {
-		fmt.Fprintf(os.Stderr, "erdos: %v\n", err)
-		os.Exit(1)
-	}
-
 	var err error
 	if len(os.Args) < 2 {
 		fmt.Fprint(os.Stdout, usage)
@@ -63,13 +53,13 @@ func main() {
 
 	switch os.Args[1] {
 	case "list":
-		err = cmdList()
+		err = erdosRemote("list", "")
 	case "search":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stdout, "usage: erdos search <query>")
 			os.Exit(0)
 		}
-		err = cmdSearch(strings.Join(os.Args[2:], " "))
+		err = erdosRemote("search", strings.Join(os.Args[2:], " "))
 	case "fetch":
 		if len(os.Args) < 3 {
 			fmt.Fprintln(os.Stdout, "usage: erdos fetch <N>")
@@ -88,12 +78,7 @@ func main() {
 	}
 }
 
-var (
-	erdosCacheDir string
-	erdosRepoDir  string
-)
-
-const erdosRemote = "git@github.com:teorth/erdosproblems.git"
+var erdosCacheDir string
 
 const usage = `usage: erdos <command> [args]
 
@@ -102,159 +87,29 @@ const usage = `usage: erdos <command> [args]
   fetch <N>         fetch problem and comments from erdosproblems.com
 `
 
-type Problem struct {
-	Number  string   `yaml:"number"  json:"number"`
-	Prize   string   `yaml:"prize"   json:"prize"`
-	Status  Status   `yaml:"status"  json:"status"`
-	OEIS    []string `yaml:"oeis"    json:"oeis"`
-	Tags    []string `yaml:"tags"    json:"tags"`
-	Comment string   `yaml:"comments" json:"comments,omitempty"`
-	Formal  Formal   `yaml:"formalized" json:"formalized"`
-}
-
-type Status struct {
-	State      string `yaml:"state"       json:"state"`
-	LastUpdate string `yaml:"last_update" json:"last_update"`
-	Note       string `yaml:"note,omitempty" json:"note,omitempty"`
-}
-
-type Formal struct {
-	State      string `yaml:"state"       json:"state"`
-	LastUpdate string `yaml:"last_update" json:"last_update"`
-}
-
-func loadProblems() ([]Problem, error) {
-	data, err := os.ReadFile(filepath.Join(erdosRepoDir, "data", "problems.yaml"))
-	if err != nil {
-		return nil, err
+func erdosRemote(subcommand, query string) error {
+	base := os.Getenv("SUPERMARKET_URL")
+	if base == "" {
+		base = "http://supermarket:9001"
 	}
-	var problems []Problem
-	if err := yaml.Unmarshal(data, &problems); err != nil {
-		return nil, err
-	}
-	return problems, nil
-}
-
-func cmdList() error {
-	problems, err := loadProblems()
+	body, err := json.Marshal(struct {
+		Subcommand string `json:"subcommand"`
+		Query      string `json:"query"`
+	}{subcommand, query})
 	if err != nil {
 		return err
 	}
-	out := struct {
-		Results  int       `json:"results"`
-		Problems []Problem `json:"problems"`
-	}{len(problems), problems}
-	return json.NewEncoder(os.Stdout).Encode(out)
-}
-
-func cmdSearch(query string) error {
-	problems, err := loadProblems()
+	resp, err := httpClient.Post(base+"/erdos", "application/json", bytes.NewReader(body))
 	if err != nil {
 		return err
 	}
-
-	docs := make([]string, len(problems))
-	for i, p := range problems {
-		docs[i] = p.Comment + " " + strings.Join(p.Tags, " ")
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		msg, _ := io.ReadAll(resp.Body)
+		return fmt.Errorf("supermarket returned %s: %s", resp.Status, bytes.TrimSpace(msg))
 	}
-
-	idx := ranking.NewBM25(nil)
-	idx.Build(docs)
-	results := idx.Search(query)
-
-	type match struct {
-		Problem
-		Score float64 `json:"score"`
-	}
-	matches := make([]match, len(results))
-	for i, r := range results {
-		matches[i] = match{problems[r.Index], r.Score}
-	}
-	if len(matches) > 20 {
-		matches = matches[:20]
-	}
-
-	out := struct {
-		Query   string  `json:"query"`
-		Results int     `json:"results"`
-		Matches []match `json:"matches"`
-	}{query, len(matches), matches}
-	return json.NewEncoder(os.Stdout).Encode(out)
-}
-
-func ensureRepo() error {
-	if err := os.MkdirAll(erdosCacheDir, 0o755); err != nil {
-		return err
-	}
-	erdosRepoDir = filepath.Join(erdosCacheDir, "erdosproblems.git")
-	if _, err := os.Stat(filepath.Join(erdosRepoDir, ".git")); err == nil {
-		return ensureFresh(erdosRepoDir)
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", "clone", erdosRemote, erdosRepoDir)
-	cmd.Stderr = os.Stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("cloning erdosproblems: %w", err)
-	}
-	return nil
-}
-
-func ensureFresh(dir string) error {
-	marker := filepath.Join(erdosCacheDir, "fetched")
-	if b, err := os.ReadFile(marker); err == nil {
-		var ts int64
-		if _, err := fmt.Sscanf(string(b), "%d", &ts); err == nil {
-			if time.Since(time.Unix(ts, 0)) < 24*time.Hour {
-				return nil
-			}
-		}
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	fetch := exec.CommandContext(ctx, "git", "-C", dir, "fetch")
-	fetch.Stderr = os.Stderr
-	if err := fetch.Run(); err != nil {
-		fmt.Fprintln(os.Stderr, "erdos: fetch failed, using cached data")
-		return nil
-	}
-	if err := os.WriteFile(marker, fmt.Appendf(nil, "%d\n", time.Now().Unix()), 0o644); err != nil {
-		fmt.Fprintf(os.Stderr, "erdos: writing marker: %v\n", err)
-	}
-	local, err := gitRev(dir, "HEAD")
-	if err != nil {
-		return fmt.Errorf("git rev-parse HEAD: %w", err)
-	}
-	remote, err := gitRev(dir, "@{u}")
-	if err != nil {
-		return fmt.Errorf("git rev-parse @{u}: %w", err)
-	}
-	if local == remote {
-		return nil
-	}
-	short := func(s string) string {
-		if len(s) > 8 {
-			return s[:8]
-		}
-		return s
-	}
-	fmt.Fprintf(os.Stderr, "erdos: updating %s..%s ... ", short(local), short(remote))
-	pull := exec.CommandContext(ctx, "git", "-C", dir, "pull", "--ff-only")
-	pull.Stderr = os.Stderr
-	if err := pull.Run(); err != nil {
-		fmt.Fprintln(os.Stderr, "update failed, using cached data")
-		return nil
-	}
-	fmt.Fprintln(os.Stderr, "done")
-	return nil
-}
-
-func gitRev(dir, ref string) (string, error) {
-	out, err := exec.Command("git", "-C", dir, "rev-parse", ref).Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
+	_, err = io.Copy(os.Stdout, resp.Body)
+	return err
 }
 
 func problemDir(number string) string {

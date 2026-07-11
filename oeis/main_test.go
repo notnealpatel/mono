@@ -2,46 +2,49 @@ package main
 
 import (
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 )
 
-func TestSearchOutputFormat(t *testing.T) {
-	type result struct {
-		ID    string  `json:"id"`
-		Name  string  `json:"name"`
-		Score float64 `json:"score"`
-	}
-	out := struct {
-		Query   string   `json:"query"`
-		Results int      `json:"results"`
-		Matches []result `json:"matches"`
-	}{
-		"groups",
-		2,
-		[]result{
-			{"A000001", "Number of groups of order n", 5.0},
-			{"A000040", "The prime numbers", 3.0},
-		},
-	}
-	data, err := json.Marshal(out)
-	if err != nil {
+func TestOeisRemoteWireFormat(t *testing.T) {
+	var gotPath string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+		io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+	t.Setenv("SUPERMARKET_URL", srv.URL)
+
+	if err := oeisRemote("show", "A000045"); err != nil {
 		t.Fatal(err)
 	}
-	var parsed struct {
-		Query   string   `json:"query"`
-		Results int      `json:"results"`
-		Matches []result `json:"matches"`
+	if gotPath != "/oeis" {
+		t.Errorf("path = %q, want /oeis", gotPath)
 	}
-	if err := json.Unmarshal(data, &parsed); err != nil {
-		t.Fatalf("output is not valid JSON: %v", err)
+	var req struct {
+		Subcommand string `json:"subcommand"`
+		Query      string `json:"query"`
 	}
-	if parsed.Query != "groups" {
-		t.Errorf("query = %q, want %q", parsed.Query, "groups")
+	if err := json.Unmarshal(gotBody, &req); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
 	}
-	if len(parsed.Matches) != 2 {
-		t.Fatalf("got %d matches, want 2", len(parsed.Matches))
+	if req.Subcommand != "show" || req.Query != "A000045" {
+		t.Errorf("request = %+v, want {show, A000045}", req)
 	}
-	if parsed.Matches[0].ID != "A000001" {
-		t.Errorf("matches[0].id = %q, want %q", parsed.Matches[0].ID, "A000001")
+}
+
+func TestOeisRemoteError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad request", http.StatusBadRequest)
+	}))
+	defer srv.Close()
+	t.Setenv("SUPERMARKET_URL", srv.URL)
+
+	if err := oeisRemote("match", "1,1,2,3,5"); err == nil {
+		t.Fatal("want error on non-200 response")
 	}
 }

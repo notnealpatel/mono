@@ -2,36 +2,52 @@ package main
 
 import (
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
 )
 
-func TestSearchMatchFields(t *testing.T) {
-	p := Problem{
-		Number: "165",
-		Tags:   []string{"combinatorics"},
-		Status: Status{State: "open"},
-	}
-	type match struct {
-		Problem
-		Score float64 `json:"score"`
-	}
-	data, err := json.Marshal(match{p, 1.5})
-	if err != nil {
+func TestErdosRemoteWireFormat(t *testing.T) {
+	var gotPath string
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		gotBody, _ = io.ReadAll(r.Body)
+		io.WriteString(w, "ok")
+	}))
+	defer srv.Close()
+	t.Setenv("SUPERMARKET_URL", srv.URL)
+
+	if err := erdosRemote("search", "sidon sets"); err != nil {
 		t.Fatal(err)
 	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(data, &fields); err != nil {
-		t.Fatal(err)
+	if gotPath != "/erdos" {
+		t.Errorf("path = %q, want /erdos", gotPath)
 	}
-	for _, key := range []string{"number", "tags", "score"} {
-		if _, ok := fields[key]; !ok {
-			t.Errorf("match missing top-level %q field", key)
-		}
+	var req struct {
+		Subcommand string `json:"subcommand"`
+		Query      string `json:"query"`
 	}
-	if _, ok := fields["problem"]; ok {
-		t.Error("match has nested problem wrapper")
+	if err := json.Unmarshal(gotBody, &req); err != nil {
+		t.Fatalf("body is not valid JSON: %v", err)
+	}
+	if req.Subcommand != "search" || req.Query != "sidon sets" {
+		t.Errorf("request = %+v, want {search, sidon sets}", req)
+	}
+}
+
+func TestErdosRemoteError(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "bad request", http.StatusBadRequest)
+	}))
+	defer srv.Close()
+	t.Setenv("SUPERMARKET_URL", srv.URL)
+
+	if err := erdosRemote("list", ""); err == nil {
+		t.Fatal("want error on non-200 response")
 	}
 }
 

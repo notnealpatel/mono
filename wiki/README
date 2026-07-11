@@ -4,16 +4,9 @@ Install:
 
 Set up:
 
-  $WIKI_CACHE_DIR should contain two bz2 downloads
-  from Wikipedia.
+  No local state. Commands POST to the supermarket
+  retrieval endpoint on the tailnet:
 
-  See: https://dumps.wikimedia.org/enwiki/20260501
+    http://supermarket:9001/wikipedia
 
-  ```
-  % la -h ~/d/wiki
-  total 26G
-  drwxr-xr-x  2 neal neal 4.0K May 30 23:34 .
-  drwxr-xr-x 13 neal neal 4.0K May 30 19:00 ..
-  -rw-r--r--  1 neal neal 269M May  6 00:28 enwiki-20260501-pages-articles-multistream-index.txt.bz2
-  -rw-r--r--  1 neal neal  25G May  6 02:07 enwiki-20260501-pages-articles-multistream.xml.bz2
-  ```
+  Override the base URL with $SUPERMARKET_URL.
